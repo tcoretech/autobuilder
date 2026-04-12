@@ -1,175 +1,187 @@
 #!/bin/bash
-set -x
+# AutoBuilder updater — one process, many deployments.
+# Scans /app/deployments/*/ every POLL_INTERVAL seconds. For each deployment:
+#   - read service.json (spec) and .env (app env vars)
+#   - clone/fetch the repo into /app/repos/<name>
+#   - on first run or new commit: rebuild the image and (re)create the container
+#
+# App containers are created directly via `docker run` on the project's default
+# network, so no generated docker-compose.yml is needed.
 
-REPO_URL="${GIT_REPO_URL}"
-BRANCH="${GIT_BRANCH:-main}"
-REPO_DIR="/app/repo"
-IMAGE_NAME="${IMAGE_NAME:-custom-website:latest}"
-SERVICE_NAME="${SERVICE_NAME:-website}"
+set -u
 
-# Ensure we have a repo URL
-if [ -z "$REPO_URL" ]; then
-    echo "Error: GIT_REPO_URL is not set."
-    echo "Please set SERVICE_GIT_REPO in your .env file."
-    # Sleep to prevent restart loop spam
-    sleep 60
-    exit 1
-fi
+DEPLOYMENTS_DIR="${DEPLOYMENTS_DIR:-/app/deployments}"
+REPOS_DIR="${REPOS_DIR:-/app/repos}"
+POLL_INTERVAL="${POLL_INTERVAL:-60}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-localai}"
+NETWORK="${COMPOSE_PROJECT_NAME}_default"
 
-# Inject Token if present
-if [ -n "$GIT_TOKEN" ]; then
-    # Simple replacement: https:// -> https://git:TOKEN@
-    # Note: This might log the token if we echo REPO_URL.
-    REPO_URL="${REPO_URL/https:\/\//https:\/\/git:$GIT_TOKEN@}"
-fi
+log() { echo "[autobuilder] $*"; }
 
-echo "Starting Git Auto-Deploy for ${GIT_REPO_URL} (${BRANCH})..."
+ensure_network() {
+    if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
+        log "network $NETWORK not found — creating"
+        docker network create "$NETWORK" >/dev/null || true
+    fi
+}
 
-# Function to build and deploy
-deploy() {
-    echo "Changes detected. Building image..."
-    cd "$REPO_DIR"
+# Reconcile one deployment folder.
+# Returns 0 on success (incl. no-op), non-zero on error.
+reconcile_one() {
+    local dir="$1"
+    local name
+    name="$(basename "$dir")"
 
-    # Auto-detect project type if Dockerfile is missing
-    if [ ! -f "Dockerfile" ]; then
-        echo "No Dockerfile found in root."
-        if [ -f "package.json" ]; then
-            echo "Detected package.json. Applying default Node.js Dockerfile..."
-            cp /app/templates/node.Dockerfile ./Dockerfile
+    [[ "$name" == _* ]] && return 0
+    [[ "$name" == .* ]] && return 0
+
+    local spec="$dir/service.json"
+    local envfile="$dir/.env"
+    [ -f "$spec" ] || return 0
+
+    local repo_url branch token port host_port cmd custom_df build_args
+    repo_url=$(jq -r '.git.repo // ""'        "$spec")
+    branch=$(  jq -r '.git.branch // "main"'  "$spec")
+    token=$(   jq -r '.git.token // ""'       "$spec")
+    port=$(    jq -r '.container.port // 3000' "$spec")
+    host_port=$(jq -r '.container.host_port // empty' "$spec")
+    cmd=$(     jq -r '.container.command // empty'    "$spec")
+    custom_df=$(jq -r '.build.dockerfile // ""'       "$spec")
+    build_args=$(jq -r '.build.args // [] | join(" ")' "$spec")
+
+    if [ -z "$repo_url" ]; then
+        log "[$name] skip: git.repo is empty"
+        return 0
+    fi
+
+    local image="${name}:latest"
+    local repo_dir="$REPOS_DIR/$name"
+    local auth_url="$repo_url"
+    if [ -n "$token" ]; then
+        auth_url="${repo_url/https:\/\//https:\/\/git:$token@}"
+    fi
+
+    # ── Git: clone or fetch ────────────────────────────────────────────────
+    local changed=0
+    if [ ! -d "$repo_dir/.git" ]; then
+        log "[$name] cloning $repo_url ($branch)"
+        rm -rf "$repo_dir"
+        mkdir -p "$(dirname "$repo_dir")"
+        if ! git clone -b "$branch" "$auth_url" "$repo_dir" >/dev/null 2>&1; then
+            log "[$name] clone failed"
+            return 1
+        fi
+        changed=1
+    else
+        (
+            cd "$repo_dir" || exit 1
+            git remote set-url origin "$auth_url"
+            git fetch origin "$branch" >/dev/null 2>&1
+        ) || { log "[$name] fetch failed"; return 1; }
+
+        local local_sha remote_sha
+        local_sha=$(  git -C "$repo_dir" rev-parse HEAD              2>/dev/null || echo "")
+        remote_sha=$( git -C "$repo_dir" rev-parse "origin/$branch"  2>/dev/null || echo "")
+        if [ "$local_sha" != "$remote_sha" ] && [ -n "$remote_sha" ]; then
+            log "[$name] update: ${local_sha:0:7} -> ${remote_sha:0:7}"
+            git -C "$repo_dir" reset --hard "origin/$branch" >/dev/null 2>&1 || true
+            changed=1
+        fi
+    fi
+
+    # Also rebuild/run if the image is missing or the container isn't running.
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        changed=1
+    fi
+    local running
+    running=$(docker ps --filter "name=^${name}$" --format '{{.Names}}' | head -n1)
+    if [ "$running" != "$name" ]; then
+        changed=1
+    fi
+
+    [ "$changed" -eq 0 ] && return 0
+
+    # ── Dockerfile resolution ──────────────────────────────────────────────
+    cd "$repo_dir" || return 1
+    if [ -n "$custom_df" ] && [ -f "$dir/$custom_df" ]; then
+        log "[$name] using custom Dockerfile from deployment folder: $custom_df"
+        cp "$dir/$custom_df" Dockerfile
+    elif [ ! -f Dockerfile ]; then
+        if [ -f package.json ]; then
+            log "[$name] no Dockerfile — using bundled node template"
+            cp /app/templates/node.Dockerfile Dockerfile
         else
-            echo "Error: No Dockerfile found and could not auto-detect project type."
-            echo "Please add a Dockerfile to your repository."
+            log "[$name] ERROR: no Dockerfile and could not auto-detect project type"
             return 1
         fi
     fi
 
-    echo "Preparing build environment..."
-    ENV_FILE="/app/config/.env"
-    BUILD_ARGS=()
-    # Create or clear .env file in the repo directory
-    REPO_ENV_FILE="$REPO_DIR/.env"
-    : > "$REPO_ENV_FILE"
-
-    # Append ARG instructions to Dockerfile for detected env vars
-    if [ -f "$ENV_FILE" ]; then
-        echo "Injecting environment variables from .env into Docker build..."
-
-        # Load configurable patterns
-        # BUILD_ARGS: Vars passed as --build-arg (Default: frontend prefixes)
-        # RUNTIME_ENV_PASSTHROUGH: Vars added to the runtime .env (Default: * i.e., everything)
-
-        B_PATTERNS="${BUILD_ARGS:-VITE_* NEXT_* PUBLIC_* REACT_* NUKS_*}"
-        R_PATTERNS="${RUNTIME_ENV_PASSTHROUGH:-*}"
-
+    # ── Build-time args (from .env, filtered by spec build.args globs) ─────
+    local -a build_cli=()
+    if [ -f "$envfile" ] && [ -n "$build_args" ]; then
         while IFS='=' read -r key value || [ -n "$key" ]; do
-            # Skip comments and empty lines
-            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
-
-            # 1. Runtime Config Logic
-            # Check if key matches RUNTIME_ENV_PASSTHROUGH
-            INCLUDE_R=false
-            if [ "$R_PATTERNS" == "*" ]; then
-                INCLUDE_R=true
-            else
-                for pattern in $R_PATTERNS; do
-                    if [[ "$key" == $pattern ]]; then INCLUDE_R=true; break; fi
-                done
-            fi
-
-            if [ "$INCLUDE_R" = true ]; then
-                echo "$key=$value" >> "$REPO_ENV_FILE"
-            fi
-
-            # 2. Build-Time Config Logic
-            # Check if key matches BUILD_ARG_PATTERNS
-            INCLUDE_B=false
-            if [ -n "$B_PATTERNS" ]; then
-                for pattern in $B_PATTERNS; do
-                    if [[ "$key" == $pattern ]]; then INCLUDE_B=true; break; fi
-                done
-            fi
-
-            if [ "$INCLUDE_B" = true ]; then
-
-                # Check if ARG already exists to avoid duplication (simple grep)
-                if ! grep -q "ARG $key" Dockerfile; then
-                    # Insert ARG passed before FROM (global ARG) or after?
-                    # Placing after FROM is safer for build usage.
-                    sed -i "/^FROM/a ARG $key" Dockerfile
+            value="${value#\'}"; value="${value%\'}"
+            value="${value#\"}"; value="${value%\"}"
+            for pattern in $build_args; do
+                if [[ "$key" == $pattern ]]; then
+                    if ! grep -q "^ARG $key" Dockerfile 2>/dev/null; then
+                        sed -i "0,/^FROM/{s/^FROM.*/&\nARG $key/}" Dockerfile
+                    fi
+                    build_cli+=("--build-arg" "$key=$value")
+                    log "[$name]   build-arg: $key"
+                    break
                 fi
-                BUILD_ARGS+=("--build-arg" "$key=$value")
-                echo " -> Added Build ARG: $key"
-            fi
-        done < "$ENV_FILE"
+            done
+        done < "$envfile"
     fi
 
-    # Ensure Dockerfile copies the generated .env file
-    # We check if COPY .env is already there
-    if ! grep -q "COPY .env" Dockerfile; then
-        # Insert COPY .env ./ before COPY . . or at the end of COPY logic
-        # Ideally, before the build step.
-        # Find the line "COPY . ." and insert before it
-        if grep -q "COPY . ." Dockerfile; then
-             sed -i '/COPY . ./i COPY .env ./' Dockerfile
-        else
-             # Fallback: append after FROM
-             sed -i '/^FROM/a COPY .env ./' Dockerfile
-        fi
+    log "[$name] building $image"
+    if ! docker build -t "$image" "${build_cli[@]}" . ; then
+        log "[$name] build failed"
+        return 1
     fi
 
-    # Build the image
-    if docker build -t "$IMAGE_NAME" "${BUILD_ARGS[@]}" .; then
-        echo "Build successful."
+    # ── (Re)create container ───────────────────────────────────────────────
+    log "[$name] (re)creating container on network $NETWORK"
+    docker rm -f "$name" >/dev/null 2>&1 || true
 
-        echo "Recreating service '$SERVICE_NAME'..."
-        cd /app/config
+    local -a run_args=(
+        -d
+        --name "$name"
+        --restart always
+        --network "$NETWORK"
+        -e "PORT=$port"
+    )
+    [ -f "$envfile" ]      && run_args+=( --env-file "$envfile" )
+    [ -n "$host_port" ]    && run_args+=( -p "$host_port:$port" )
 
-        # Use docker compose to recreate the service with the new image
-        # We use --no-deps to avoid restarting the updater itself if possible,
-        # though updater depends on nothing.
-        if docker compose up -d --no-deps "$SERVICE_NAME"; then
-            echo "Service updated successfully."
-        else
-            echo "Failed to update service."
+    if [ -n "$cmd" ]; then
+        if ! docker run "${run_args[@]}" "$image" sh -c "$cmd" >/dev/null; then
+            log "[$name] run failed"
+            return 1
         fi
     else
-        echo "Build failed!"
+        if ! docker run "${run_args[@]}" "$image" >/dev/null; then
+            log "[$name] run failed"
+            return 1
+        fi
     fi
+
+    log "[$name] deployed"
+    return 0
 }
 
-# Initial Clone or Update
-if [ ! -d "$REPO_DIR/.git" ]; then
-    echo "Cloning repository..."
-    git clone -b "$BRANCH" "$REPO_URL" "$REPO_DIR"
-    # Perform initial deploy after clone
-    deploy
-else
-    echo "Repository exists. Checking for updates..."
-    cd "$REPO_DIR"
-    git fetch origin "$BRANCH"
-    git reset --hard "origin/$BRANCH"
-    # We might want to force a deploy on startup just in case the image is missing
-    deploy
-fi
+# ── Main loop ────────────────────────────────────────────────────────────────
+log "started — project=$COMPOSE_PROJECT_NAME network=$NETWORK interval=${POLL_INTERVAL}s"
+ensure_network
 
-# Loop
 while true; do
-    # Check every 60 seconds
-    sleep 60
-
-    cd "$REPO_DIR"
-    echo "Checking for updates..."
-    git fetch origin "$BRANCH"
-
-    LOCAL=$(git rev-parse HEAD)
-    REMOTE=$(git rev-parse "origin/$BRANCH")
-
-    if [ "$LOCAL" != "$REMOTE" ]; then
-        echo "Update detected! ($LOCAL -> $REMOTE)"
-        git pull origin "$BRANCH"
-        deploy
-    else
-        echo "No updates. ($LOCAL)"
-    fi
+    shopt -s nullglob
+    for dir in "$DEPLOYMENTS_DIR"/*/; do
+        reconcile_one "$dir" || log "reconcile error in $(basename "$dir")"
+    done
+    shopt -u nullglob
+    sleep "$POLL_INTERVAL"
 done

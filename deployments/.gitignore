@@ -1,0 +1,4 @@
+# Ignore all deployment folders (they contain tokens) except the tracked _example template
+/*
+!/.gitignore
+!/_example

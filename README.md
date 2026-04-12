@@ -1,76 +1,160 @@
 # AutoBuilder
 
-GitOps auto-deployment service for AI CoreKit. Point it at any git repository and it will clone, build, and redeploy your application on every new commit.
+GitOps deployment engine for AI CoreKit. **One** autobuilder container manages **many** auto-built repositories, each described by a folder under `deployments/`.
 
-## How it works
+The autobuilder polls the deployments folder and reconciles app containers directly via the Docker socket. Every `POLL_INTERVAL` seconds (default 60s) it fetches each deployment's branch, rebuilds the image if the commit changed, and (re)creates the app container on the project's default network.
 
-AutoBuilder runs two containers:
+## Deployment anatomy
 
-- **autobuilder** — the running application (built from your repo)
-- **autobuilder-updater** — a sidecar that watches the git repo, rebuilds the Docker image on new commits, and recreates the app container
+Each deployment is a folder containing a spec file, an env file, and optionally a Dockerfile override:
 
-## Usage
-
-### Standalone (docker compose)
-
-```bash
-cp .env.example .env
-# edit .env — set SERVICE_GIT_REPO at minimum
-docker compose up -d
+```
+deployments/main-site/
+├── service.json   # git repo, branch, token, port, build args, command (structured)
+├── .env           # app environment variables (passed via --env-file)
+└── Dockerfile     # (optional) custom Dockerfile if the repo doesn't have one
 ```
 
-### Via AI CoreKit
+All `deployments/*/` folders are gitignored — tokens and app secrets stay off disk history. The `_example/` template is tracked as a starting point.
 
-```bash
-corekit up autobuilder
+## service.json schema
+
+```jsonc
+{
+  "name": "main-site",                       // must match folder name; becomes container name and image tag
+  "git": {
+    "repo":   "https://github.com/org/repo",
+    "branch": "main",
+    "token":  "ghp_…"                        // optional; only needed for private repos
+  },
+  "container": {
+    "port":      3000,                       // port the app listens on inside the container
+    "host_port": 3000,                       // optional; publish on host. Omit or null to keep internal
+    "command":   "npm run preview -- --host" // optional; overrides Dockerfile CMD
+  },
+  "build": {
+    "dockerfile": null,                      // optional: relative path inside the deployment folder
+    "args": ["VITE_*", "NEXT_PUBLIC_*"]      // glob patterns — matched against .env for --build-arg injection
+  }
+}
 ```
 
-## Configuration
+## .env (app env vars)
 
-Copy `.env.example` to `.env` and set:
+Pure, unprefixed environment variables for the running app container. They're passed via `--env-file` — no stripping, no filtering.
 
 ```bash
-# Required — repo to build and deploy
-SERVICE_GIT_REPO='https://github.com/yourorg/your-app.git'
-
-# Optional — for private repos
-SERVICE_GIT_TOKEN='ghp_yourtoken'
-
-# Optional — branch to track (default: main)
-SERVICE_GIT_BRANCH='main'
+# deployments/main-site/.env
+GEMINI_API_KEY=sk_live_...
+SERVICE_ALLOWED_HOSTS=tcoretech.com,localhost,main-site
+VITE_ALLOWED_HOSTS=tcoretech.com,localhost,main-site
 ```
 
-## Environment Variable Injection
+## Build-time vs runtime env
 
-AutoBuilder gives you fine-grained control over which variables from `.env` reach your app:
-
-| Variable | Controls | Default |
+| When | What gets through | Controlled by |
 |---|---|---|
-| `RUNTIME_ENV_PASSTHROUGH` | Which vars are passed to the running container | `*` (all) |
-| `BUILD_ARGS` | Which vars are passed as `--build-arg` during `docker build` | `VITE_* NEXT_* PUBLIC_* REACT_* NUKS_*` |
+| `docker build` | Vars from `.env` whose keys match `build.args` globs — passed as `--build-arg` | `service.json` → `build.args` |
+| Container runtime | Every var in `.env` — passed via `--env-file` | `.env` alone |
 
-**Example — restrict what reaches the container:**
-```bash
-RUNTIME_ENV_PASSTHROUGH='MYAPP_* DATABASE_*'
-BUILD_ARGS='VITE_*'
-```
+Frontend frameworks that inline env vars at compile time (Vite, Next.js, Create React App) need **build-time** args. Everything else lives happily in the runtime env.
 
-## Auto-Detection
+## Managing deployments
 
-If your repo has no `Dockerfile`, AutoBuilder detects the project type and applies a default template:
-
-| Detected | Template used |
-|---|---|
-| `package.json` | Node.js / npm |
-
-## Logs
+AutoBuilder exposes a CLI via corekit's standard `run` command:
 
 ```bash
-# Standalone
-docker compose logs -f autobuilder
-docker compose logs -f autobuilder-updater
-
-# Via CoreKit
-corekit logs autobuilder
-corekit logs autobuilder-updater
+corekit run autobuilder help                  # show all commands
+corekit run autobuilder list                  # list deployments + container status
+corekit run autobuilder add my-app            # scaffold deployments/my-app/ from the template
+corekit run autobuilder edit my-app           # edit service.json in $EDITOR
+corekit run autobuilder show my-app           # print spec (token redacted) + .env
+corekit run autobuilder rebuild my-app        # force an immediate rebuild
+corekit run autobuilder logs -f               # tail autobuilder logs
+corekit run autobuilder app-logs my-app -f    # tail the app container's logs
+corekit run autobuilder reload                # restart autobuilder to reconcile immediately
+corekit run autobuilder remove my-app         # stop, delete image, delete folder
 ```
+
+## Typical workflow
+
+```bash
+# 1. Scaffold a new deployment
+corekit run autobuilder add landing-page
+
+# 2. Configure it
+$EDITOR services/custom-services/autobuilder/deployments/landing-page/service.json
+$EDITOR services/custom-services/autobuilder/deployments/landing-page/.env
+
+# 3. Start autobuilder (first time) or reload (already running)
+corekit up autobuilder
+# or: corekit run autobuilder reload
+
+# 4. Watch the first build
+corekit run autobuilder logs -f
+```
+
+## Dockerfile resolution
+
+For each deployment, autobuilder uses the first of these it finds:
+
+1. **Custom Dockerfile from the deployment folder** — set `build.dockerfile` in `service.json` to a relative path (e.g. `"Dockerfile"`). Copied into the repo at build time.
+2. **The repo's own `Dockerfile`** — used as-is.
+3. **Auto-detected template** — if the repo has `package.json`, a bundled Node.js Dockerfile template is used.
+
+## How it hangs together
+
+```
+corekit up autobuilder
+  ├─ secrets.sh     (no-op)
+  ├─ prepare.sh     → validates deployments/*/service.json, ensures data/repos/<name>/ dirs
+  ├─ build.sh       → docker build ./updater -t autobuilder:latest
+  ├─ docker compose up -d           (static compose: one service, `autobuilder`)
+  └─ healthcheck.sh → confirms the autobuilder container is running
+
+Inside the autobuilder container, every POLL_INTERVAL seconds:
+  for each deployments/<name>/:
+    ├─ read service.json (spec) and .env
+    ├─ clone or fetch into /app/repos/<name>
+    ├─ if new commit / missing image / container not running:
+    │    ├─ build <name>:latest with the spec's build.args as --build-arg
+    │    └─ docker run -d --name <name> --network <project>_default --env-file .env <name>:latest
+    └─ continue
+```
+
+All app containers live on the `<project>_default` network (e.g. `localai_default`), so Caddy and any other core-stack service can reach them by container name.
+
+## Standalone usage (without corekit)
+
+```bash
+cd services/custom-services/autobuilder
+
+# 1. Create a deployment folder
+mkdir -p deployments/my-app
+cp deployments/_example/service.json deployments/my-app/service.json
+cp deployments/_example/.env.example  deployments/my-app/.env
+$EDITOR deployments/my-app/service.json
+$EDITOR deployments/my-app/.env
+
+# 2. Build the updater image and start
+bash prepare.sh
+bash build.sh
+docker compose -p localai up -d
+```
+
+## Migrating from a standalone service (e.g. main-site)
+
+If you have an old service directory that was cloned from autobuilder:
+
+```bash
+corekit run autobuilder add main-site
+# Copy values from services/custom-services/main-site/.env into:
+#   deployments/main-site/service.json   (git, container, build.args)
+#   deployments/main-site/.env           (app env vars only — GEMINI_API_KEY, VITE_*, etc.)
+
+corekit disable main-site                     # drop the old service from profiles
+corekit down main-site                        # stop the old container
+corekit up autobuilder                        # autobuilder brings up main-site; name unchanged
+```
+
+The new container's name is the same (`main-site`), so any Caddy routes or cross-service references keep working.

@@ -1,3 +1,3 @@
 #!/bin/bash
-# The updater sidecar handles all startup and deployment logic.
+# Each updater sidecar handles clone/build/deploy for its deployment.
 exit 0

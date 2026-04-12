@@ -2,11 +2,11 @@
   "name": "autobuilder",
   "display_name": "AutoBuilder",
   "category": "Custom Services",
-  "rank": 101,
-  "description": "GitOps auto-deployment service for AI CoreKit — watches a git repo and rebuilds/redeploys on every commit",
+  "rank": 100,
+  "description": "GitOps deployment engine — one service manages many auto-built repos via deployments/<name>/",
   "interface": null,
   "source": null,
-  "depends_on": null,
-  "version": "1.0.0",
+  "depends_on": [],
+  "version": "2.0.0",
   "dependencies": []
 }

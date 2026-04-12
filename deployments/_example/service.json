@@ -1,0 +1,17 @@
+{
+  "name": "my-app",
+  "git": {
+    "repo": "https://github.com/yourorg/your-repo.git",
+    "branch": "main",
+    "token": ""
+  },
+  "container": {
+    "port": 3000,
+    "host_port": null,
+    "command": null
+  },
+  "build": {
+    "dockerfile": null,
+    "args": ["VITE_*", "NEXT_PUBLIC_*", "PUBLIC_*"]
+  }
+}

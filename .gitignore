@@ -1,0 +1,5 @@
+# Runtime data (cloned repos, etc.)
+data/
+
+# Service-level env (may contain overrides)
+.env

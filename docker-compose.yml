@@ -1,32 +1,14 @@
 services:
+
   autobuilder:
-    image: ${SERVICE_IMAGE_NAME:-autobuilder:latest}
+    image: autobuilder:latest
     container_name: autobuilder
     restart: always
     pull_policy: never
-    env_file:
-      - .env
-    environment:
-      - PORT=${SERVICE_PORT:-3000}
-    expose:
-      - "${SERVICE_PORT:-3000}"
-    command: ${SERVICE_COMMAND:-}
-
-  autobuilder-updater:
-    image: autobuilder-updater:latest
-    build: ./updater
-    container_name: autobuilder-updater
-    restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data/repo:/app/repo
-      - ./:/app/config
-    env_file:
-      - .env
+      - ./deployments:/app/deployments:ro
+      - ./data/repos:/app/repos
     environment:
-      - GIT_REPO_URL=${SERVICE_GIT_REPO}
-      - GIT_BRANCH=${SERVICE_GIT_BRANCH:-main}
-      - GIT_TOKEN=${SERVICE_GIT_TOKEN}
-      - IMAGE_NAME=${SERVICE_IMAGE_NAME:-autobuilder:latest}
-      - SERVICE_NAME=autobuilder
       - COMPOSE_PROJECT_NAME=${PROJECT_NAME:-localai}
+      - POLL_INTERVAL=${POLL_INTERVAL:-60}

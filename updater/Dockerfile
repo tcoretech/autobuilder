@@ -1,6 +1,6 @@
 FROM docker:cli
 
-RUN apk add --no-cache git bash curl
+RUN apk add --no-cache git bash curl jq
 
 # Install Docker Compose plugin
 RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
