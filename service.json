@@ -1,0 +1,12 @@
+{
+  "name": "autobuilder",
+  "display_name": "AutoBuilder",
+  "category": "Custom Services",
+  "rank": 101,
+  "description": "GitOps auto-deployment service — watches a git repo and rebuilds/redeploys on every commit",
+  "interface": null,
+  "source": null,
+  "depends_on": null,
+  "version": "1.0.0",
+  "dependencies": []
+}
