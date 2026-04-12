@@ -1,6 +1,6 @@
 # AutoBuilder
 
-GitOps auto-deployment service for AI LaunchKit. Point it at any git repository and it will clone, build, and redeploy your application on every new commit.
+GitOps auto-deployment service for AI CoreKit. Point it at any git repository and it will clone, build, and redeploy your application on every new commit.
 
 ## How it works
 
@@ -9,26 +9,36 @@ AutoBuilder runs two containers:
 - **autobuilder** — the running application (built from your repo)
 - **autobuilder-updater** — a sidecar that watches the git repo, rebuilds the Docker image on new commits, and recreates the app container
 
-## Setup
+## Usage
 
-1. Copy `.env.example` to `.env`:
-   ```bash
-   cp .env.example .env
-   ```
+### Standalone (docker compose)
 
-2. Configure your repository:
-   ```bash
-   # Required
-   SERVICE_GIT_REPO='https://github.com/yourorg/your-app.git'
+```bash
+cp .env.example .env
+# edit .env — set SERVICE_GIT_REPO at minimum
+docker compose up -d
+```
 
-   # For private repos
-   SERVICE_GIT_TOKEN='ghp_yourtoken'
-   ```
+### Via AI CoreKit
 
-3. Start:
-   ```bash
-   corekit up autobuilder
-   ```
+```bash
+corekit up autobuilder
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` and set:
+
+```bash
+# Required — repo to build and deploy
+SERVICE_GIT_REPO='https://github.com/yourorg/your-app.git'
+
+# Optional — for private repos
+SERVICE_GIT_TOKEN='ghp_yourtoken'
+
+# Optional — branch to track (default: main)
+SERVICE_GIT_BRANCH='main'
+```
 
 ## Environment Variable Injection
 
@@ -39,7 +49,7 @@ AutoBuilder gives you fine-grained control over which variables from `.env` reac
 | `RUNTIME_ENV_PASSTHROUGH` | Which vars are passed to the running container | `*` (all) |
 | `BUILD_ARGS` | Which vars are passed as `--build-arg` during `docker build` | `VITE_* NEXT_* PUBLIC_* REACT_* NUKS_*` |
 
-**Example:**
+**Example — restrict what reaches the container:**
 ```bash
 RUNTIME_ENV_PASSTHROUGH='MYAPP_* DATABASE_*'
 BUILD_ARGS='VITE_*'
@@ -56,9 +66,11 @@ If your repo has no `Dockerfile`, AutoBuilder detects the project type and appli
 ## Logs
 
 ```bash
-# Application logs
-corekit logs autobuilder
+# Standalone
+docker compose logs -f autobuilder
+docker compose logs -f autobuilder-updater
 
-# Updater / deployment logs
+# Via CoreKit
+corekit logs autobuilder
 corekit logs autobuilder-updater
 ```
