@@ -199,6 +199,24 @@ cmd_rebuild() {
     log_success "Triggered. Watch: corekit run autobuilder logs -f"
 }
 
+cmd_migrate() {
+    local name="$1"
+    require_name "$name"
+    deployment_exists "$name" || { log_error "Deployment '$name' not found"; exit 1; }
+    if ! autobuilder_running; then
+        log_error "autobuilder is not running. Start it with: corekit up autobuilder"
+        exit 1
+    fi
+    local has_pbr
+    has_pbr=$(jq -r '.post_build_run // empty' "$DEPLOYMENTS_DIR/$name/service.json")
+    if [ -z "$has_pbr" ]; then
+        log_error "Deployment '$name' has no post_build_run configured"
+        exit 1
+    fi
+    log_info "Running post_build_run for $name..."
+    exec docker exec -i "$AUTOBUILDER_CONTAINER" /app/start.sh run-post "$name"
+}
+
 cmd_reload() {
     if ! autobuilder_running; then
         log_error "autobuilder is not running"
@@ -231,6 +249,7 @@ Commands:
   logs [args]              Follow the autobuilder's logs (extra args passed to docker logs)
   app-logs <name> [args]   Follow an app container's logs
   rebuild <name>           Force an immediate rebuild of one deployment
+  migrate <name>           Run the deployment's post_build_run target once
   reload                   Restart the autobuilder to reconcile immediately
   edit <name>              Open service.json in $EDITOR
   help                     Show this message
@@ -252,6 +271,7 @@ case "$CMD" in
     logs)         cmd_logs "$@" ;;
     app-logs)     cmd_app_logs "$@" ;;
     rebuild)      cmd_rebuild "$@" ;;
+    migrate)      cmd_migrate "$@" ;;
     reload|reconcile) cmd_reload ;;
     edit)         cmd_edit "$@" ;;
     help|--help|-h|"") cmd_help ;;
