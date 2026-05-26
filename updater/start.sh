@@ -16,6 +16,11 @@ POLL_INTERVAL="${POLL_INTERVAL:-60}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-localai}"
 NETWORK="${COMPOSE_PROJECT_NAME}_default"
 
+# Host-side absolute path corresponding to DEPLOYMENTS_DIR inside this container.
+# Required so `docker run -v` can mount deployment subdirs onto app containers
+# (the docker daemon resolves volume paths on the host, not in this container).
+DEPLOYMENTS_HOST_PATH="${DEPLOYMENTS_HOST_PATH:-}"
+
 log() { echo "[autobuilder] $*"; }
 
 ensure_network() {
@@ -23,6 +28,24 @@ ensure_network() {
         log "network $NETWORK not found — creating"
         docker network create "$NETWORK" >/dev/null || true
     fi
+}
+
+# Translate a deployment-relative host path (./foo or foo) into an absolute
+# host path under DEPLOYMENTS_HOST_PATH/<name>. Absolute paths are passed
+# through untouched.
+resolve_host_path() {
+    local name="$1" rel="$2"
+    if [[ "$rel" == /* ]]; then
+        echo "$rel"
+        return
+    fi
+    rel="${rel#./}"
+    if [ -z "$DEPLOYMENTS_HOST_PATH" ]; then
+        log "[$name] WARN: DEPLOYMENTS_HOST_PATH unset; volume '$rel' may not resolve correctly"
+        echo "$rel"
+        return
+    fi
+    echo "${DEPLOYMENTS_HOST_PATH%/}/${name}/${rel}"
 }
 
 # Reconcile one deployment folder.
@@ -39,15 +62,17 @@ reconcile_one() {
     local envfile="$dir/.env"
     [ -f "$spec" ] || return 0
 
-    local repo_url branch token port host_port cmd custom_df build_args
-    repo_url=$(jq -r '.git.repo // ""'        "$spec")
-    branch=$(  jq -r '.git.branch // "main"'  "$spec")
-    token=$(   jq -r '.git.token // ""'       "$spec")
-    port=$(    jq -r '.container.port // 3000' "$spec")
-    host_port=$(jq -r '.container.host_port // empty' "$spec")
-    cmd=$(     jq -r '.container.command // empty'    "$spec")
-    custom_df=$(jq -r '.build.dockerfile // ""'       "$spec")
-    build_args=$(jq -r '.build.args // [] | join(" ")' "$spec")
+    local repo_url branch token port host_port cmd custom_df dockerfile_path target build_args
+    repo_url=$(    jq -r '.git.repo // ""'              "$spec")
+    branch=$(      jq -r '.git.branch // "main"'        "$spec")
+    token=$(       jq -r '.git.token // ""'             "$spec")
+    port=$(        jq -r '.container.port // 3000'      "$spec")
+    host_port=$(   jq -r '.container.host_port // empty' "$spec")
+    cmd=$(         jq -r '.container.command // empty'  "$spec")
+    custom_df=$(   jq -r '.build.dockerfile // ""'      "$spec")
+    dockerfile_path=$(jq -r '.build.dockerfile_path // ""' "$spec")
+    target=$(      jq -r '.build.target // ""'          "$spec")
+    build_args=$(  jq -r '.build.args // [] | join(" ")' "$spec")
 
     if [ -z "$repo_url" ]; then
         log "[$name] skip: git.repo is empty"
@@ -102,8 +127,23 @@ reconcile_one() {
     [ "$changed" -eq 0 ] && return 0
 
     # ── Dockerfile resolution ──────────────────────────────────────────────
+    # Precedence:
+    #   1. build.dockerfile_path  — path inside the cloned repo; passed via -f,
+    #      build context stays at repo root.
+    #   2. build.dockerfile       — path inside the deployment folder, copied
+    #      into the repo root as `Dockerfile` (legacy behaviour).
+    #   3. repo's existing Dockerfile at the root.
+    #   4. bundled node template if package.json is present.
     cd "$repo_dir" || return 1
-    if [ -n "$custom_df" ] && [ -f "$dir/$custom_df" ]; then
+    local build_file=""
+    if [ -n "$dockerfile_path" ]; then
+        if [ ! -f "$repo_dir/$dockerfile_path" ]; then
+            log "[$name] ERROR: build.dockerfile_path '$dockerfile_path' not found in repo"
+            return 1
+        fi
+        build_file="$dockerfile_path"
+        log "[$name] using in-repo Dockerfile: $dockerfile_path"
+    elif [ -n "$custom_df" ] && [ -f "$dir/$custom_df" ]; then
         log "[$name] using custom Dockerfile from deployment folder: $custom_df"
         cp "$dir/$custom_df" Dockerfile
     elif [ ! -f Dockerfile ]; then
@@ -116,8 +156,21 @@ reconcile_one() {
         fi
     fi
 
-    # ── Build-time args (from .env, filtered by spec build.args globs) ─────
+    # ── Build-time args ───────────────────────────────────────────────────
+    # Two sources, merged:
+    #   a) build.args (glob list) — keys matched against the .env file
+    #   b) build.args_map (object) — explicit key:value pairs in service.json
     local -a build_cli=()
+
+    # (a) .env-glob source
+    # When the Dockerfile is autobuilder-managed (custom from deployment folder
+    # or bundled template), inject `ARG KEY` after FROM so that build-args
+    # work even if the source Dockerfile doesn't declare them. For in-repo
+    # Dockerfiles (build.dockerfile_path), trust the author and skip injection.
+    local inject_args=0
+    if [ -z "$dockerfile_path" ]; then
+        inject_args=1
+    fi
     if [ -f "$envfile" ] && [ -n "$build_args" ]; then
         while IFS='=' read -r key value || [ -n "$key" ]; do
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
@@ -126,21 +179,76 @@ reconcile_one() {
             value="${value#\"}"; value="${value%\"}"
             for pattern in $build_args; do
                 if [[ "$key" == $pattern ]]; then
-                    if ! grep -q "^ARG $key" Dockerfile 2>/dev/null; then
+                    if [ "$inject_args" -eq 1 ] && ! grep -q "^ARG $key" Dockerfile 2>/dev/null; then
                         sed -i "0,/^FROM/{s/^FROM.*/&\nARG $key/}" Dockerfile
                     fi
                     build_cli+=("--build-arg" "$key=$value")
-                    log "[$name]   build-arg: $key"
+                    log "[$name]   build-arg (from .env): $key"
                     break
                 fi
             done
         done < "$envfile"
     fi
 
-    log "[$name] building $image"
-    if ! docker build -t "$image" "${build_cli[@]}" . ; then
+    # (b) explicit map source
+    local args_map_keys
+    args_map_keys=$(jq -r '.build.args_map // {} | keys[]?' "$spec" 2>/dev/null || true)
+    if [ -n "$args_map_keys" ]; then
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            local v
+            v=$(jq -r --arg k "$key" '.build.args_map[$k] // ""' "$spec")
+            build_cli+=("--build-arg" "$key=$v")
+            log "[$name]   build-arg (from args_map): $key"
+        done <<< "$args_map_keys"
+    fi
+
+    # ── Build ──────────────────────────────────────────────────────────────
+    local -a build_cmd=(docker build -t "$image")
+    [ -n "$target"     ] && build_cmd+=( --target "$target" )
+    [ -n "$build_file" ] && build_cmd+=( -f "$build_file" )
+    build_cmd+=( "${build_cli[@]}" . )
+
+    log "[$name] building $image${target:+ (target=$target)}${build_file:+ (-f $build_file)}"
+    if ! "${build_cmd[@]}"; then
         log "[$name] build failed"
         return 1
+    fi
+
+    # ── post_build_run: one-shot container (e.g. migrations) ───────────────
+    # Schema: { "dockerfile_path": "...", "target": "...", "command": "...",
+    #           "image_tag": "..." (default <name>-post:latest),
+    #           "auto":      true|false (default true; false = manual only) }
+    local pbr_df pbr_target pbr_cmd pbr_image pbr_auto
+    pbr_df=$(    jq -r '.post_build_run.dockerfile_path // ""' "$spec")
+    pbr_target=$(jq -r '.post_build_run.target // ""'          "$spec")
+    pbr_cmd=$(   jq -r '.post_build_run.command // ""'         "$spec")
+    pbr_image=$( jq -r --arg n "$name" '.post_build_run.image_tag // ($n + "-post:latest")' "$spec")
+    pbr_auto=$(  jq -r '.post_build_run.auto // true'          "$spec")
+
+    if { [ -n "$pbr_df" ] || [ -n "$pbr_target" ]; } && [ "$pbr_auto" = "true" ]; then
+        local -a pbr_build=(docker build -t "$pbr_image")
+        [ -n "$pbr_target" ] && pbr_build+=( --target "$pbr_target" )
+        [ -n "$pbr_df"     ] && pbr_build+=( -f "$pbr_df" )
+        pbr_build+=( "${build_cli[@]}" . )
+
+        log "[$name] post-build: building $pbr_image${pbr_target:+ (target=$pbr_target)}"
+        if ! "${pbr_build[@]}"; then
+            log "[$name] post-build image build failed"
+            return 1
+        fi
+
+        local -a pbr_run=(docker run --rm --network "$NETWORK")
+        [ -f "$envfile" ] && pbr_run+=( --env-file "$envfile" )
+        if [ -n "$pbr_cmd" ]; then
+            pbr_run+=( "$pbr_image" sh -c "$pbr_cmd" )
+        else
+            pbr_run+=( "$pbr_image" )
+        fi
+        log "[$name] post-build: running $pbr_image"
+        if ! "${pbr_run[@]}"; then
+            log "[$name] post-build run failed (continuing — app container will still start)"
+        fi
     fi
 
     # ── (Re)create container ───────────────────────────────────────────────
@@ -154,8 +262,28 @@ reconcile_one() {
         --network "$NETWORK"
         -e "PORT=$port"
     )
-    [ -f "$envfile" ]      && run_args+=( --env-file "$envfile" )
-    [ -n "$host_port" ]    && run_args+=( -p "$host_port:$port" )
+    [ -f "$envfile" ]   && run_args+=( --env-file "$envfile" )
+    [ -n "$host_port" ] && run_args+=( -p "$host_port:$port" )
+
+    # Volumes: array of strings "<src>:<dst>[:flags]". <src> can be:
+    #   - absolute host path (passed through),
+    #   - relative path (resolved against DEPLOYMENTS_HOST_PATH/<name>/).
+    local vol_count
+    vol_count=$(jq -r '.volumes // [] | length' "$spec")
+    if [ "$vol_count" -gt 0 ]; then
+        local i=0
+        while [ "$i" -lt "$vol_count" ]; do
+            local entry src rest
+            entry=$(jq -r --argjson i "$i" '.volumes[$i]' "$spec")
+            src="${entry%%:*}"
+            rest="${entry#*:}"
+            local abs
+            abs="$(resolve_host_path "$name" "$src")"
+            run_args+=( -v "${abs}:${rest}" )
+            log "[$name]   volume: ${abs}:${rest}"
+            i=$((i + 1))
+        done
+    fi
 
     if [ -n "$cmd" ]; then
         if ! docker run "${run_args[@]}" "$image" sh -c "$cmd" >/dev/null; then
@@ -173,8 +301,99 @@ reconcile_one() {
     return 0
 }
 
+# ── Manual one-shot post_build_run (e.g. CLI-driven migrations) ──────────────
+# Builds and runs the post_build_run target for a single deployment, regardless
+# of git/image state. Invoked via `start.sh run-post <name>`.
+run_post_only() {
+    local name="$1"
+    local dir="$DEPLOYMENTS_DIR/$name"
+    local spec="$dir/service.json"
+    local envfile="$dir/.env"
+    [ -f "$spec" ] || { log "[$name] no service.json"; return 1; }
+
+    local repo_url branch token build_args
+    repo_url=$(  jq -r '.git.repo // ""'    "$spec")
+    branch=$(    jq -r '.git.branch // "main"' "$spec")
+    token=$(     jq -r '.git.token // ""'   "$spec")
+    build_args=$(jq -r '.build.args // [] | join(" ")' "$spec")
+
+    local pbr_df pbr_target pbr_cmd pbr_image
+    pbr_df=$(    jq -r '.post_build_run.dockerfile_path // ""' "$spec")
+    pbr_target=$(jq -r '.post_build_run.target // ""'          "$spec")
+    pbr_cmd=$(   jq -r '.post_build_run.command // ""'         "$spec")
+    pbr_image=$( jq -r --arg n "$name" '.post_build_run.image_tag // ($n + "-post:latest")' "$spec")
+
+    if [ -z "$pbr_df" ] && [ -z "$pbr_target" ]; then
+        log "[$name] no post_build_run configured"
+        return 1
+    fi
+
+    local repo_dir="$REPOS_DIR/$name"
+    if [ ! -d "$repo_dir/.git" ]; then
+        log "[$name] cloning $repo_url ($branch) for post-build run"
+        local auth_url="$repo_url"
+        [ -n "$token" ] && auth_url="${repo_url/https:\/\//https:\/\/git:$token@}"
+        rm -rf "$repo_dir"
+        mkdir -p "$(dirname "$repo_dir")"
+        git clone -b "$branch" "$auth_url" "$repo_dir" >/dev/null 2>&1 || { log "[$name] clone failed"; return 1; }
+    fi
+
+    cd "$repo_dir" || return 1
+
+    local -a build_cli=()
+    if [ -f "$envfile" ] && [ -n "$build_args" ]; then
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            value="${value#\'}"; value="${value%\'}"
+            value="${value#\"}"; value="${value%\"}"
+            for pattern in $build_args; do
+                if [[ "$key" == $pattern ]]; then
+                    build_cli+=("--build-arg" "$key=$value")
+                    break
+                fi
+            done
+        done < "$envfile"
+    fi
+    local args_map_keys
+    args_map_keys=$(jq -r '.build.args_map // {} | keys[]?' "$spec" 2>/dev/null || true)
+    if [ -n "$args_map_keys" ]; then
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            local v
+            v=$(jq -r --arg k "$key" '.build.args_map[$k] // ""' "$spec")
+            build_cli+=("--build-arg" "$key=$v")
+        done <<< "$args_map_keys"
+    fi
+
+    local -a pbr_build=(docker build -t "$pbr_image")
+    [ -n "$pbr_target" ] && pbr_build+=( --target "$pbr_target" )
+    [ -n "$pbr_df"     ] && pbr_build+=( -f "$pbr_df" )
+    pbr_build+=( "${build_cli[@]}" . )
+
+    log "[$name] post-build (manual): building $pbr_image"
+    "${pbr_build[@]}" || { log "[$name] build failed"; return 1; }
+
+    local -a pbr_run=(docker run --rm --network "$NETWORK")
+    [ -f "$envfile" ] && pbr_run+=( --env-file "$envfile" )
+    if [ -n "$pbr_cmd" ]; then
+        pbr_run+=( "$pbr_image" sh -c "$pbr_cmd" )
+    else
+        pbr_run+=( "$pbr_image" )
+    fi
+    log "[$name] post-build (manual): running $pbr_image"
+    "${pbr_run[@]}"
+}
+
+# ── Entrypoint ───────────────────────────────────────────────────────────────
+if [ "${1:-}" = "run-post" ]; then
+    run_post_only "$2"
+    exit $?
+fi
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 log "started — project=$COMPOSE_PROJECT_NAME network=$NETWORK interval=${POLL_INTERVAL}s"
+[ -n "$DEPLOYMENTS_HOST_PATH" ] && log "deployments host path: $DEPLOYMENTS_HOST_PATH"
 ensure_network
 
 while true; do

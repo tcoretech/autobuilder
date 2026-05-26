@@ -12,3 +12,4 @@ services:
     environment:
       - COMPOSE_PROJECT_NAME=${PROJECT_NAME:-localai}
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
+      - DEPLOYMENTS_HOST_PATH=${DEPLOYMENTS_HOST_PATH:-}

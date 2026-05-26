@@ -12,6 +12,11 @@
   },
   "build": {
     "dockerfile": null,
-    "args": ["VITE_*", "NEXT_PUBLIC_*", "PUBLIC_*"]
-  }
+    "dockerfile_path": null,
+    "target": null,
+    "args": ["VITE_*", "NEXT_PUBLIC_*", "PUBLIC_*"],
+    "args_map": {}
+  },
+  "volumes": [],
+  "post_build_run": null
 }

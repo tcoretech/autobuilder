@@ -33,11 +33,25 @@ All `deployments/*/` folders are gitignored — tokens and app secrets stay off 
     "command":   "npm run preview -- --host" // optional; overrides Dockerfile CMD
   },
   "build": {
-    "dockerfile": null,                      // optional: relative path inside the deployment folder
-    "args": ["VITE_*", "NEXT_PUBLIC_*"]      // glob patterns — matched against .env for --build-arg injection
+    "dockerfile":      null,                 // path inside the deployment folder; copied into the repo as `Dockerfile`
+    "dockerfile_path": null,                 // path inside the cloned repo; passed via -f (context stays at repo root)
+    "target":          null,                 // multi-stage build target (e.g. "runtime")
+    "args":            ["VITE_*", "NEXT_PUBLIC_*"],  // glob patterns — matched against .env for --build-arg injection
+    "args_map":        {}                    // explicit { KEY: "value" } build args, merged with the glob list
+  },
+  "volumes": [                               // optional bind mounts. Relative <src> paths resolve under
+    "./data:/data",                          // <deployments-host-path>/<name>/<src>; absolute paths pass through.
+    "./config/settings.env:/config/settings.env:ro"
+  ],
+  "post_build_run": {                        // optional one-shot run after each rebuild (e.g. db migrations)
+    "dockerfile_path": "deploy/Dockerfile",  //   built with the same build_args as the main image
+    "target":          "migrator",
+    "command":         null                  //   optional override of the image's CMD
   }
 }
 ```
+
+`dockerfile_path` takes precedence over `dockerfile`. Specify at most one.
 
 ## .env (app env vars)
 
@@ -70,6 +84,7 @@ corekit run autobuilder add my-app            # scaffold deployments/my-app/ fro
 corekit run autobuilder edit my-app           # edit service.json in $EDITOR
 corekit run autobuilder show my-app           # print spec (token redacted) + .env
 corekit run autobuilder rebuild my-app        # force an immediate rebuild
+corekit run autobuilder migrate my-app        # run the deployment's post_build_run target on demand
 corekit run autobuilder logs -f               # tail autobuilder logs
 corekit run autobuilder app-logs my-app -f    # tail the app container's logs
 corekit run autobuilder reload                # restart autobuilder to reconcile immediately
@@ -98,9 +113,10 @@ corekit run autobuilder logs -f
 
 For each deployment, autobuilder uses the first of these it finds:
 
-1. **Custom Dockerfile from the deployment folder** — set `build.dockerfile` in `service.json` to a relative path (e.g. `"Dockerfile"`). Copied into the repo at build time.
-2. **The repo's own `Dockerfile`** — used as-is.
-3. **Auto-detected template** — if the repo has `package.json`, a bundled Node.js Dockerfile template is used.
+1. **In-repo Dockerfile by path** — set `build.dockerfile_path` in `service.json` to a path inside the cloned repo (e.g. `"deploy/docker/Dockerfile.web"`). Passed via `-f`; the build context stays at the repo root. Combines naturally with `build.target` for multi-stage Dockerfiles.
+2. **Custom Dockerfile from the deployment folder** — set `build.dockerfile` to a path inside the deployment folder. Copied into the repo at build time.
+3. **The repo's own `Dockerfile`** — used as-is.
+4. **Auto-detected template** — if the repo has `package.json`, a bundled Node.js Dockerfile template is used.
 
 ## How it hangs together
 
@@ -123,6 +139,44 @@ Inside the autobuilder container, every POLL_INTERVAL seconds:
 ```
 
 All app containers live on the `<project>_default` network (e.g. `localai_default`), so Caddy and any other core-stack service can reach them by container name.
+
+## Volume mounts
+
+Add bind mounts in `service.json` under `volumes`. Each entry is a string of the form `<src>:<dst>[:flags]`:
+
+- Relative `<src>` (e.g. `./data/api`) resolves to `<deployments-host-path>/<deployment-name>/<src>` on the host. The autobuilder learns its host path from the `DEPLOYMENTS_HOST_PATH` env var (set by `prepare.sh`).
+- Absolute `<src>` passes through unchanged.
+
+```jsonc
+"volumes": [
+  "./data/api:/data",
+  "./data/music:/fixtures/music:ro",
+  "./config/settings.env:/config/settings.env:ro"
+]
+```
+
+## Post-build run (one-shot containers)
+
+Some deployments need a side-effect container after each rebuild — database migrations being the classic case. Configure `post_build_run` in `service.json`:
+
+```jsonc
+"post_build_run": {
+  "dockerfile_path": "deploy/docker/Dockerfile.web",
+  "target":          "migrator",
+  "command":         null,
+  "auto":            true   // default true — fire every rebuild. Set false for manual-only.
+}
+```
+
+When `auto` is true, the autobuilder builds the named target into `<name>-post:latest` after each successful main-image build, runs it once with `--rm --env-file .env --network <project>_default`, then proceeds to (re)create the long-running app container.
+
+When `auto` is false, the spec stays dormant and you trigger it manually:
+
+```bash
+corekit run autobuilder migrate <name>
+```
+
+The CLI invokes `docker exec autobuilder /app/start.sh run-post <name>`, which performs the same build + run flow on demand regardless of the `auto` flag.
 
 ## Standalone usage (without corekit)
 
