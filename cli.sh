@@ -167,8 +167,17 @@ cmd_remove() {
 }
 
 cmd_logs() {
+    if [ -n "${1:-}" ] && [[ "$1" != -* ]]; then
+        if deployment_exists "$1"; then
+            cmd_app_logs "$@"
+            return
+        fi
+        log_error "Deployment '$1' not found"
+        exit 1
+    fi
+
     if autobuilder_running; then
-        exec docker logs "$AUTOBUILDER_CONTAINER" "$@"
+        exec docker logs "$@" "$AUTOBUILDER_CONTAINER"
     else
         log_error "autobuilder container is not running"
         exit 1
@@ -179,7 +188,7 @@ cmd_app_logs() {
     local name="$1"; shift || true
     require_name "$name"
     deployment_exists "$name" || { log_error "Deployment '$name' not found"; exit 1; }
-    exec docker logs "$name" "$@"
+    exec docker logs "$@" "$name"
 }
 
 cmd_rebuild() {
@@ -247,6 +256,7 @@ Commands:
   add <name>               Scaffold a new deployment from the _example template
   remove <name>            Stop container, remove image, delete deployment folder
   logs [args]              Follow the autobuilder's logs (extra args passed to docker logs)
+  logs <name> [args]       Follow one app container's logs
   app-logs <name> [args]   Follow an app container's logs
   rebuild <name>           Force an immediate rebuild of one deployment
   migrate <name>           Run the deployment's post_build_run target once

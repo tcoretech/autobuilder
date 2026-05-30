@@ -6,7 +6,8 @@
 #   - on first run or new commit: rebuild the image and (re)create the container
 #
 # App containers are created directly via `docker run` on the project's default
-# network, so no generated docker-compose.yml is needed.
+# network. CoreKit's generic child-label contract makes them discoverable even
+# though they are not Docker Compose services themselves.
 
 set -u
 
@@ -102,7 +103,7 @@ reconcile_one() {
     local envfile="$dir/.env"
     [ -f "$spec" ] || return 0
 
-    local repo_url branch token port host_port cmd custom_df dockerfile_path target build_args
+    local repo_url branch token port host_port cmd custom_df dockerfile_path target
     repo_url=$(    jq -r '.git.repo // ""'              "$spec")
     branch=$(      jq -r '.git.branch // "main"'        "$spec")
     token=$(       jq -r '.git.token // ""'             "$spec")
@@ -112,7 +113,14 @@ reconcile_one() {
     custom_df=$(   jq -r '.build.dockerfile // ""'      "$spec")
     dockerfile_path=$(jq -r '.build.dockerfile_path // ""' "$spec")
     target=$(      jq -r '.build.target // ""'          "$spec")
-    build_args=$(  jq -r '.build.args // [] | join(" ")' "$spec")
+    local -a build_arg_patterns=()
+    mapfile -t build_arg_patterns < <(jq -r '.build.args // [] | .[]' "$spec")
+    for pattern in "${build_arg_patterns[@]}"; do
+        if [ "$pattern" = "*" ]; then
+            log "[$name] WARN: build.args '*' passes every key from this deployment's .env as Docker build args; avoid this for secrets"
+            break
+        fi
+    done
 
     if [ -z "$repo_url" ]; then
         log "[$name] skip: git.repo is empty"
@@ -240,13 +248,13 @@ reconcile_one() {
     if [ -z "$dockerfile_path" ]; then
         inject_args=1
     fi
-    if [ -f "$envfile" ] && [ -n "$build_args" ]; then
+    if [ -f "$envfile" ] && [ ${#build_arg_patterns[@]} -gt 0 ]; then
         while IFS='=' read -r key value || [ -n "$key" ]; do
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
             value="${value#\'}"; value="${value%\'}"
             value="${value#\"}"; value="${value%\"}"
-            for pattern in $build_args; do
+            for pattern in "${build_arg_patterns[@]}"; do
                 if [[ "$key" == $pattern ]]; then
                     if [ "$inject_args" -eq 1 ] && ! grep -q "^ARG $key" Dockerfile 2>/dev/null; then
                         sed -i "0,/^FROM/{s/^FROM.*/&\nARG $key/}" Dockerfile
@@ -276,9 +284,15 @@ reconcile_one() {
     local -a build_cmd=(
         docker build
         --label "corekit.autobuilder=true"
+        --label "corekit.autobuilder.parent=autobuilder"
+        --label "corekit.autobuilder.project=$COMPOSE_PROJECT_NAME"
         --label "corekit.autobuilder.deployment=$name"
         --label "corekit.autobuilder.config-sha=$config_hash"
         --label "corekit.autobuilder.repo-sha=$remote_sha"
+        --label "corekit.child=true"
+        --label "corekit.parent.service=autobuilder"
+        --label "corekit.project=$COMPOSE_PROJECT_NAME"
+        --label "corekit.service=$name"
         -t "$image"
     )
     [ -n "$target"     ] && build_cmd+=( --target "$target" )
@@ -314,7 +328,19 @@ reconcile_one() {
             return 1
         fi
 
-        local -a pbr_run=(docker run --rm --network "$NETWORK")
+        local -a pbr_run=(
+            docker run
+            --rm
+            --network "$NETWORK"
+            --label "corekit.autobuilder=true"
+            --label "corekit.autobuilder.parent=autobuilder"
+            --label "corekit.autobuilder.project=$COMPOSE_PROJECT_NAME"
+            --label "corekit.autobuilder.deployment=$name"
+            --label "corekit.child=true"
+            --label "corekit.parent.service=autobuilder"
+            --label "corekit.project=$COMPOSE_PROJECT_NAME"
+            --label "corekit.service=$name"
+        )
         [ -f "$envfile" ] && pbr_run+=( --env-file "$envfile" )
         if [ -n "$pbr_cmd" ]; then
             pbr_run+=( "$pbr_image" sh -c "$pbr_cmd" )
@@ -338,9 +364,15 @@ reconcile_one() {
         --restart always
         --network "$NETWORK"
         --label "corekit.autobuilder=true"
+        --label "corekit.autobuilder.parent=autobuilder"
+        --label "corekit.autobuilder.project=$COMPOSE_PROJECT_NAME"
         --label "corekit.autobuilder.deployment=$name"
         --label "corekit.autobuilder.config-sha=$config_hash"
         --label "corekit.autobuilder.repo-sha=$remote_sha"
+        --label "corekit.child=true"
+        --label "corekit.parent.service=autobuilder"
+        --label "corekit.project=$COMPOSE_PROJECT_NAME"
+        --label "corekit.service=$name"
         -e "PORT=$port"
     )
     [ -f "$envfile" ]   && run_args+=( --env-file "$envfile" )
@@ -392,11 +424,18 @@ run_post_only() {
     local envfile="$dir/.env"
     [ -f "$spec" ] || { log "[$name] no service.json"; return 1; }
 
-    local repo_url branch token build_args
+    local repo_url branch token
     repo_url=$(  jq -r '.git.repo // ""'    "$spec")
     branch=$(    jq -r '.git.branch // "main"' "$spec")
     token=$(     jq -r '.git.token // ""'   "$spec")
-    build_args=$(jq -r '.build.args // [] | join(" ")' "$spec")
+    local -a build_arg_patterns=()
+    mapfile -t build_arg_patterns < <(jq -r '.build.args // [] | .[]' "$spec")
+    for pattern in "${build_arg_patterns[@]}"; do
+        if [ "$pattern" = "*" ]; then
+            log "[$name] WARN: build.args '*' passes every key from this deployment's .env as Docker build args; avoid this for secrets"
+            break
+        fi
+    done
 
     local pbr_df pbr_target pbr_cmd pbr_image
     pbr_df=$(    jq -r '.post_build_run.dockerfile_path // ""' "$spec")
@@ -422,13 +461,13 @@ run_post_only() {
     cd "$repo_dir" || return 1
 
     local -a build_cli=()
-    if [ -f "$envfile" ] && [ -n "$build_args" ]; then
+    if [ -f "$envfile" ] && [ ${#build_arg_patterns[@]} -gt 0 ]; then
         while IFS='=' read -r key value || [ -n "$key" ]; do
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
             value="${value#\'}"; value="${value%\'}"
             value="${value#\"}"; value="${value%\"}"
-            for pattern in $build_args; do
+            for pattern in "${build_arg_patterns[@]}"; do
                 if [[ "$key" == $pattern ]]; then
                     build_cli+=("--build-arg" "$key=$value")
                     break
@@ -455,7 +494,19 @@ run_post_only() {
     log "[$name] post-build (manual): building $pbr_image"
     "${pbr_build[@]}" || { log "[$name] build failed"; return 1; }
 
-    local -a pbr_run=(docker run --rm --network "$NETWORK")
+    local -a pbr_run=(
+        docker run
+        --rm
+        --network "$NETWORK"
+        --label "corekit.autobuilder=true"
+        --label "corekit.autobuilder.parent=autobuilder"
+        --label "corekit.autobuilder.project=$COMPOSE_PROJECT_NAME"
+        --label "corekit.autobuilder.deployment=$name"
+        --label "corekit.child=true"
+        --label "corekit.parent.service=autobuilder"
+        --label "corekit.project=$COMPOSE_PROJECT_NAME"
+        --label "corekit.service=$name"
+    )
     [ -f "$envfile" ] && pbr_run+=( --env-file "$envfile" )
     if [ -n "$pbr_cmd" ]; then
         pbr_run+=( "$pbr_image" sh -c "$pbr_cmd" )
@@ -464,6 +515,29 @@ run_post_only() {
     fi
     log "[$name] post-build (manual): running $pbr_image"
     "${pbr_run[@]}"
+}
+
+prune_removed_deployments() {
+    docker ps -a --filter "label=corekit.autobuilder=true" \
+        --format "{{.Names}}\t{{.Label \"corekit.autobuilder.deployment\"}}\t{{.Label \"corekit.autobuilder.project\"}}" |
+    while IFS=$'\t' read -r container_name deployment project_name; do
+        [ -n "$container_name" ] || continue
+
+        [ "$deployment" = "<no value>" ] && deployment=""
+        [ "$project_name" = "<no value>" ] && project_name=""
+
+        # Older AutoBuilder containers did not carry a project label. Treat
+        # them as belonging to this updater so one upgrade can clean them up.
+        if [ -n "$project_name" ] && [ "$project_name" != "$COMPOSE_PROJECT_NAME" ]; then
+            continue
+        fi
+
+        [ -n "$deployment" ] || deployment="$container_name"
+        if [ ! -f "$DEPLOYMENTS_DIR/$deployment/service.json" ]; then
+            log "[$deployment] removing orphaned container $container_name: deployment folder is gone"
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+        fi
+    done
 }
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
@@ -483,5 +557,6 @@ while true; do
         reconcile_one "$dir" || log "reconcile error in $(basename "$dir")"
     done
     shopt -u nullglob
+    prune_removed_deployments
     sleep "$POLL_INTERVAL"
 done

@@ -4,6 +4,8 @@ GitOps deployment engine for AI CoreKit. **One** autobuilder container manages *
 
 The autobuilder polls the deployments folder and reconciles app containers directly via the Docker socket. Every `POLL_INTERVAL` seconds (default 60s) it fetches each deployment's branch, rebuilds the image when the deployment hash changes, and (re)creates the app container on the project's default network.
 
+Each app container is labeled with CoreKit's generic managed-child labels (`corekit.child=true`, `corekit.parent.service`, `corekit.project`, and `corekit.service`). `corekit ps` includes any container using that generic contract, and `corekit down autobuilder` removes AutoBuilder's children through this service's cleanup hook. If the `autobuilder` profile is disabled, `corekit up` pruning also stops the disabled parent service so its cleanup hook can remove labeled children.
+
 The deployment hash covers the fetched repo commit, `service.json`, `.env`, and any deployment-folder Dockerfile override. AutoBuilder stores that hash as Docker labels on the image and app container, so changes to runtime env, build args, ports, commands, volumes, or deployment Dockerfile content are reconciled even when the git commit is unchanged.
 
 ## Deployment anatomy
@@ -70,10 +72,10 @@ VITE_ALLOWED_HOSTS=tcoretech.com,localhost,main-site
 
 | When | What gets through | Controlled by |
 |---|---|---|
-| `docker build` | Vars from `.env` whose keys match `build.args` globs — passed as `--build-arg` | `service.json` → `build.args` |
+| `docker build` | Vars from the deployment's own `.env` whose keys match `build.args` globs — passed as `--build-arg`; use `"*"` only when you intentionally want every key from that one deployment `.env` | `service.json` → `build.args` |
 | Container runtime | Every var in `.env` — passed via `--env-file` | `.env` alone |
 
-Frontend frameworks that inline env vars at compile time (Vite, Next.js, Create React App) need **build-time** args. Everything else lives happily in the runtime env.
+Frontend frameworks that inline env vars at compile time (Vite, Next.js, Create React App) need **build-time** args. Everything else lives happily in the runtime env. Prefer narrow patterns like `NEXT_PUBLIC_*`, `VITE_*`, or `PUBLIC_*`. Passing `"*"` is convenient, but Docker build args are not a secret mechanism and may be exposed through Dockerfile usage, image metadata/provenance, or build cache. For in-repo Dockerfiles, the Dockerfile still needs matching `ARG` declarations before Docker will make those values available during build.
 
 ## Managing deployments
 
@@ -88,6 +90,7 @@ corekit run autobuilder show my-app           # print spec (token redacted) + .e
 corekit run autobuilder rebuild my-app        # force an immediate rebuild
 corekit run autobuilder migrate my-app        # run the deployment's post_build_run target on demand
 corekit run autobuilder logs -f               # tail autobuilder logs
+corekit run autobuilder logs my-app -f        # tail an app container's logs
 corekit run autobuilder app-logs my-app -f    # tail the app container's logs
 corekit run autobuilder reload                # restart autobuilder to reconcile immediately
 corekit run autobuilder remove my-app         # stop, delete image, delete folder
@@ -138,11 +141,11 @@ Inside the autobuilder container, every POLL_INTERVAL seconds:
     ├─ if hash changed / missing image / missing, failed, or unhealthy container:
     │    ├─ build <name>:latest with the spec's build.args as --build-arg
     │    ├─ run automatic post_build_run, if configured
-    │    └─ docker run -d --name <name> --network <project>_default --env-file .env <name>:latest
+    │    └─ docker run -d --name <name> --network <project>_default --label corekit.child=true --env-file .env <name>:latest
     └─ continue
 ```
 
-All app containers live on the `<project>_default` network (e.g. `localai_default`), so Caddy and any other core-stack service can reach them by container name.
+All app containers live on the `<project>_default` network (e.g. `localai_default`), so Caddy and any other core-stack service can reach them by container name. Removing a deployment folder also removes the previously managed container during the next reconcile loop.
 
 ## Volume mounts
 
