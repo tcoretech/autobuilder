@@ -48,6 +48,46 @@ resolve_host_path() {
     echo "${DEPLOYMENTS_HOST_PATH%/}/${name}/${rel}"
 }
 
+hash_file_or_empty() {
+    local file_path="$1"
+    if [ -f "$file_path" ]; then
+        sha256sum "$file_path" | awk '{print $1}'
+    fi
+}
+
+compute_config_hash() {
+    local remote_sha="$1" spec="$2" envfile="$3" custom_dockerfile="$4" deploy_dir="$5"
+    local custom_dockerfile_hash=""
+
+    if [ -n "$custom_dockerfile" ] && [ -f "$deploy_dir/$custom_dockerfile" ]; then
+        custom_dockerfile_hash="$(hash_file_or_empty "$deploy_dir/$custom_dockerfile")"
+    fi
+
+    {
+        printf 'repo_sha=%s\n' "$remote_sha"
+        printf 'service_json_sha=%s\n' "$(hash_file_or_empty "$spec")"
+        printf 'env_sha=%s\n' "$(hash_file_or_empty "$envfile")"
+        printf 'custom_dockerfile_sha=%s\n' "$custom_dockerfile_hash"
+    } | sha256sum | awk '{print $1}'
+}
+
+container_label() {
+    local container_name="$1" label_name="$2" label_value
+    label_value=$(docker container inspect -f "{{ index .Config.Labels \"$label_name\" }}" "$container_name" 2>/dev/null || true)
+    [ "$label_value" = "<no value>" ] && label_value=""
+    echo "$label_value"
+}
+
+container_state() {
+    local container_name="$1"
+    docker container inspect -f '{{ .State.Status }}' "$container_name" 2>/dev/null || true
+}
+
+container_health() {
+    local container_name="$1"
+    docker container inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ end }}' "$container_name" 2>/dev/null || true
+}
+
 # Reconcile one deployment folder.
 # Returns 0 on success (incl. no-op), non-zero on error.
 reconcile_one() {
@@ -88,6 +128,7 @@ reconcile_one() {
 
     # ── Git: clone or fetch ────────────────────────────────────────────────
     local changed=0
+    local local_sha="" remote_sha=""
     if [ ! -d "$repo_dir/.git" ]; then
         log "[$name] cloning $repo_url ($branch)"
         rm -rf "$repo_dir"
@@ -96,6 +137,7 @@ reconcile_one() {
             log "[$name] clone failed"
             return 1
         fi
+        remote_sha=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")
         changed=1
     else
         (
@@ -104,7 +146,6 @@ reconcile_one() {
             git fetch origin "$branch" >/dev/null 2>&1
         ) || { log "[$name] fetch failed"; return 1; }
 
-        local local_sha remote_sha
         local_sha=$(  git -C "$repo_dir" rev-parse HEAD              2>/dev/null || echo "")
         remote_sha=$( git -C "$repo_dir" rev-parse "origin/$branch"  2>/dev/null || echo "")
         if [ "$local_sha" != "$remote_sha" ] && [ -n "$remote_sha" ]; then
@@ -113,14 +154,42 @@ reconcile_one() {
             changed=1
         fi
     fi
+    [ -n "$remote_sha" ] || remote_sha=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")
 
-    # Also rebuild/run if the image is missing or the container isn't running.
+    local config_hash
+    config_hash="$(compute_config_hash "$remote_sha" "$spec" "$envfile" "$custom_df" "$dir")"
+
+    # Also rebuild/run if the image is missing, container is failed/unhealthy,
+    # or the desired deployment config differs from the running container.
     if ! docker image inspect "$image" >/dev/null 2>&1; then
+        log "[$name] image missing: $image"
         changed=1
     fi
-    local running
-    running=$(docker ps --filter "name=^${name}$" --format '{{.Names}}' | head -n1)
-    if [ "$running" != "$name" ]; then
+
+    local state_status health_status current_hash
+    state_status="$(container_state "$name")"
+    if [ -z "$state_status" ]; then
+        log "[$name] container missing"
+        changed=1
+    elif [ "$state_status" != "running" ]; then
+        log "[$name] container state is $state_status"
+        changed=1
+    else
+        health_status="$(container_health "$name")"
+        if [ "$health_status" = "unhealthy" ]; then
+            log "[$name] container health is unhealthy"
+            changed=1
+        fi
+    fi
+
+    current_hash=""
+    [ -n "$state_status" ] && current_hash="$(container_label "$name" "corekit.autobuilder.config-sha")"
+    if [ -n "$state_status" ] && [ "$current_hash" != "$config_hash" ]; then
+        if [ -n "$current_hash" ]; then
+            log "[$name] config changed: ${current_hash:0:12} -> ${config_hash:0:12}"
+        else
+            log "[$name] config hash missing: ${config_hash:0:12}"
+        fi
         changed=1
     fi
 
@@ -204,7 +273,14 @@ reconcile_one() {
     fi
 
     # ── Build ──────────────────────────────────────────────────────────────
-    local -a build_cmd=(docker build -t "$image")
+    local -a build_cmd=(
+        docker build
+        --label "corekit.autobuilder=true"
+        --label "corekit.autobuilder.deployment=$name"
+        --label "corekit.autobuilder.config-sha=$config_hash"
+        --label "corekit.autobuilder.repo-sha=$remote_sha"
+        -t "$image"
+    )
     [ -n "$target"     ] && build_cmd+=( --target "$target" )
     [ -n "$build_file" ] && build_cmd+=( -f "$build_file" )
     build_cmd+=( "${build_cli[@]}" . )
@@ -247,7 +323,8 @@ reconcile_one() {
         fi
         log "[$name] post-build: running $pbr_image"
         if ! "${pbr_run[@]}"; then
-            log "[$name] post-build run failed (continuing — app container will still start)"
+            log "[$name] post-build run failed; aborting deployment"
+            return 1
         fi
     fi
 
@@ -260,6 +337,10 @@ reconcile_one() {
         --name "$name"
         --restart always
         --network "$NETWORK"
+        --label "corekit.autobuilder=true"
+        --label "corekit.autobuilder.deployment=$name"
+        --label "corekit.autobuilder.config-sha=$config_hash"
+        --label "corekit.autobuilder.repo-sha=$remote_sha"
         -e "PORT=$port"
     )
     [ -f "$envfile" ]   && run_args+=( --env-file "$envfile" )

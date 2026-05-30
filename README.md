@@ -2,7 +2,9 @@
 
 GitOps deployment engine for AI CoreKit. **One** autobuilder container manages **many** auto-built repositories, each described by a folder under `deployments/`.
 
-The autobuilder polls the deployments folder and reconciles app containers directly via the Docker socket. Every `POLL_INTERVAL` seconds (default 60s) it fetches each deployment's branch, rebuilds the image if the commit changed, and (re)creates the app container on the project's default network.
+The autobuilder polls the deployments folder and reconciles app containers directly via the Docker socket. Every `POLL_INTERVAL` seconds (default 60s) it fetches each deployment's branch, rebuilds the image when the deployment hash changes, and (re)creates the app container on the project's default network.
+
+The deployment hash covers the fetched repo commit, `service.json`, `.env`, and any deployment-folder Dockerfile override. AutoBuilder stores that hash as Docker labels on the image and app container, so changes to runtime env, build args, ports, commands, volumes, or deployment Dockerfile content are reconciled even when the git commit is unchanged.
 
 ## Deployment anatomy
 
@@ -132,8 +134,10 @@ Inside the autobuilder container, every POLL_INTERVAL seconds:
   for each deployments/<name>/:
     ├─ read service.json (spec) and .env
     ├─ clone or fetch into /app/repos/<name>
-    ├─ if new commit / missing image / container not running:
+    ├─ compute desired deployment hash from commit + spec + env + Dockerfile override
+    ├─ if hash changed / missing image / missing, failed, or unhealthy container:
     │    ├─ build <name>:latest with the spec's build.args as --build-arg
+    │    ├─ run automatic post_build_run, if configured
     │    └─ docker run -d --name <name> --network <project>_default --env-file .env <name>:latest
     └─ continue
 ```
@@ -168,7 +172,7 @@ Some deployments need a side-effect container after each rebuild — database mi
 }
 ```
 
-When `auto` is true, the autobuilder builds the named target into `<name>-post:latest` after each successful main-image build, runs it once with `--rm --env-file .env --network <project>_default`, then proceeds to (re)create the long-running app container.
+When `auto` is true, the autobuilder builds the named target into `<name>-post:latest` after each successful main-image build, runs it once with `--rm --env-file .env --network <project>_default`, then proceeds to (re)create the long-running app container. If the automatic post-build run fails, deployment stops and the existing app container is left in place.
 
 When `auto` is false, the spec stays dormant and you trigger it manually:
 
