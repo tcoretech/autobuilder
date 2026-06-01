@@ -43,9 +43,11 @@ All `deployments/*/` folders are gitignored — tokens and app secrets stay off 
     "args":            ["VITE_*", "NEXT_PUBLIC_*"],  // glob patterns — matched against .env for --build-arg injection
     "args_map":        {}                    // explicit { KEY: "value" } build args, merged with the glob list
   },
-  "volumes": [                               // optional bind mounts. Relative <src> paths resolve under
-    "./data:/data",                          // <deployments-host-path>/<name>/<src>; absolute paths pass through.
-    "./config/settings.env:/config/settings.env:ro"
+  "volumes": [                               // optional bind mounts. <src> may be:
+    "./data:/data",                          //   - a relative path resolved under <deployments-host-path>/<name>/<src>,
+    "./config/settings.env:/config/settings.env:ro",
+    "${ASSETS_DIR}/sample-data:/srv/sample:ro",    //  - or an env-var reference; ${VAR} and ${VAR:-default}
+    "${OPTIONAL_PATH:-/srv/empty}:/srv/optional:ro" //   are expanded against the deployment's own .env.
   ],
   "post_build_run": {                        // optional one-shot run after each rebuild (e.g. db migrations)
     "dockerfile_path": "deploy/Dockerfile",  //   built with the same build_args as the main image
@@ -153,14 +155,18 @@ Add bind mounts in `service.json` under `volumes`. Each entry is a string of the
 
 - Relative `<src>` (e.g. `./data/api`) resolves to `<deployments-host-path>/<deployment-name>/<src>` on the host. The autobuilder learns its host path from the `DEPLOYMENTS_HOST_PATH` env var (set by `prepare.sh`).
 - Absolute `<src>` passes through unchanged.
+- `<src>` may reference environment variables via `${VAR}` or `${VAR:-default}` syntax. Variables resolve against the deployment's own `.env`, which is sourced into a subshell at volume-resolution time (so deployments don't leak vars to each other). After expansion the result is classified as absolute or relative using the rules above.
 
 ```jsonc
 "volumes": [
-  "./data/api:/data",
-  "./data/music:/fixtures/music:ro",
-  "./config/settings.env:/config/settings.env:ro"
+  "./data/api:/data",                                // relative — resolves under <deployments-host-path>/<name>/data/api
+  "./config/settings.env:/config/settings.env:ro",
+  "${ASSETS_DIR}/sample-data:/srv/sample:ro",        // env var must be defined in this deployment's .env
+  "${OPTIONAL_PATH:-/srv/empty}:/srv/optional:ro"    // falls back to /srv/empty if OPTIONAL_PATH unset
 ]
 ```
+
+Use env-var-driven absolute paths when your deployment needs to mount data that lives outside its deployment folder — datasets curated elsewhere on the host, large files you don't want under the deployment directory, or developer-machine-specific paths.
 
 ## Post-build run (one-shot containers)
 

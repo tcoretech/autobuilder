@@ -31,11 +31,38 @@ ensure_network() {
     fi
 }
 
+# Expand ${VAR} and ${VAR:-default} occurrences in $1 against the calling
+# environment. Pure-bash, no eval, so safe to run on operator-supplied strings
+# from service.json. Unset variables with no default render to an empty string.
+expand_env_in() {
+    local s="$1"
+    local pattern='\$\{([A-Z_][A-Z0-9_]*)(:-([^}]*))?\}'
+    while [[ "$s" =~ $pattern ]]; do
+        local match="${BASH_REMATCH[0]}"
+        local var="${BASH_REMATCH[1]}"
+        local default_val="${BASH_REMATCH[3]}"
+        local value
+        if [ -n "${!var:-}" ]; then
+            value="${!var}"
+        else
+            value="$default_val"
+        fi
+        local before="${s%%"$match"*}"
+        local after="${s#*"$match"}"
+        s="${before}${value}${after}"
+    done
+    printf '%s' "$s"
+}
+
 # Translate a deployment-relative host path (./foo or foo) into an absolute
 # host path under DEPLOYMENTS_HOST_PATH/<name>. Absolute paths are passed
-# through untouched.
+# through untouched. Environment variable references (${VAR} or
+# ${VAR:-default}) are expanded first, so deployments can mount paths that
+# live outside the deployment directory — e.g. shared test fixtures pinned
+# via PYDJ_FIXTURES_DIR in the deployment's .env.
 resolve_host_path() {
     local name="$1" rel="$2"
+    rel="$(expand_env_in "$rel")"
     if [[ "$rel" == /* ]]; then
         echo "$rel"
         return
@@ -380,7 +407,10 @@ reconcile_one() {
 
     # Volumes: array of strings "<src>:<dst>[:flags]". <src> can be:
     #   - absolute host path (passed through),
-    #   - relative path (resolved against DEPLOYMENTS_HOST_PATH/<name>/).
+    #   - relative path (resolved against DEPLOYMENTS_HOST_PATH/<name>/),
+    #   - or either of the above with ${VAR} / ${VAR:-default} env references
+    #     resolved against the deployment's .env (sourced in a subshell so
+    #     vars don't leak between deployments).
     local vol_count
     vol_count=$(jq -r '.volumes // [] | length' "$spec")
     if [ "$vol_count" -gt 0 ]; then
@@ -391,7 +421,15 @@ reconcile_one() {
             src="${entry%%:*}"
             rest="${entry#*:}"
             local abs
-            abs="$(resolve_host_path "$name" "$src")"
+            abs="$(
+                if [ -f "$envfile" ]; then
+                    set -a
+                    # shellcheck disable=SC1090
+                    source "$envfile" 2>/dev/null || true
+                    set +a
+                fi
+                resolve_host_path "$name" "$src"
+            )"
             run_args+=( -v "${abs}:${rest}" )
             log "[$name]   volume: ${abs}:${rest}"
             i=$((i + 1))
