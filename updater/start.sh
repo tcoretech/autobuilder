@@ -134,6 +134,19 @@ reconcile_one() {
     repo_url=$(    jq -r '.git.repo // ""'              "$spec")
     branch=$(      jq -r '.git.branch // "main"'        "$spec")
     token=$(       jq -r '.git.token // ""'             "$spec")
+    # Builder-side secrets (git credentials). Deliberately NOT .env: .env is
+    # handed to the container via --env-file, and a push-capable token has no
+    # business inside a public-facing app container.
+    local secretsfile="$dir/.secrets.env"
+    token="$(
+        if [ -f "$secretsfile" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$secretsfile"
+            set +a
+        fi
+        expand_env_in "$token"
+    )"
     port=$(        jq -r '.container.port // 3000'      "$spec")
     host_port=$(   jq -r '.container.host_port // empty' "$spec")
     cmd=$(         jq -r '.container.command // empty'  "$spec")
@@ -466,6 +479,19 @@ run_post_only() {
     repo_url=$(  jq -r '.git.repo // ""'    "$spec")
     branch=$(    jq -r '.git.branch // "main"' "$spec")
     token=$(     jq -r '.git.token // ""'   "$spec")
+    # Builder-side secrets (git credentials). Deliberately NOT .env: .env is
+    # handed to the container via --env-file, and a push-capable token has no
+    # business inside a public-facing app container.
+    local secretsfile="$dir/.secrets.env"
+    token="$(
+        if [ -f "$secretsfile" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$secretsfile"
+            set +a
+        fi
+        expand_env_in "$token"
+    )"
     local -a build_arg_patterns=()
     mapfile -t build_arg_patterns < <(jq -r '.build.args // [] | .[]' "$spec")
     for pattern in "${build_arg_patterns[@]}"; do
